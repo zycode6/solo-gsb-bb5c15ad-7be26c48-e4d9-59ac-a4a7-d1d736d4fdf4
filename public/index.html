@@ -77,6 +77,21 @@
       <div id="conflicts" class="conflicts"></div>
       <div id="toast" class="toast" hidden></div>
     </section>
+
+    <section class="panel diff-panel" id="diff-panel">
+      <div class="panel-head">
+        <h2>📊 版本差异审计 <span class="hint">导入基线路由表，与当前规则按<strong>首条命中语义</strong>比较整个请求空间（全部方法 × 全部路径，非抽样检查）</span></h2>
+        <div class="head-right">
+          <div id="diff-summary" class="summary"></div>
+          <button id="btn-baseline-import" class="btn" type="button">导入基线 JSON</button>
+          <button id="btn-baseline-snapshot" class="btn" type="button">将当前设为基线</button>
+          <button id="btn-baseline-clear" class="btn btn-ghost" type="button" hidden>清除基线</button>
+          <input id="file-baseline" type="file" accept="application/json,.json" hidden />
+        </div>
+      </div>
+      <div id="baseline-info" class="baseline-info"></div>
+      <div id="diff-result" class="diff-result"></div>
+    </section>
   </main>
 
   <script src="/app.js"></script>

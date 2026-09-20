@@ -475,5 +475,151 @@ check('samples: 不传 samples 时响应不含相关字段（向后兼容）', (
   assert.strictEqual('sampleReplay' in res2.fixPlan, false);
 });
 
+// ---------- 版本差异审计（baselineRules / diff） ----------
+check('diff: 不传 baselineRules 时响应不含 diff 字段（向后兼容）', () => {
+  const res = analyze([{ method: 'GET', path: '/a' }]);
+  assert.strictEqual('diff' in res, false);
+  const res2 = analyze([{ method: 'GET', path: '/a' }], { baselineRules: [] });
+  assert.ok('diff' in res2);
+});
+
+check('diff: 与基线完全一致时无变化条目', () => {
+  const rules = [
+    { method: 'GET', path: '/a/*' },
+    { method: 'GET', path: '/a/b' },
+    { method: 'POST', path: '/p' },
+  ];
+  const res = analyze(rules, { baselineRules: rules.map((r) => ({ ...r })) });
+  assert.strictEqual(res.diff.summary.total, 0);
+  assert.strictEqual(res.diff.identical, true);
+  assert.strictEqual(res.diff.truncated, false);
+  assert.deepStrictEqual(res.diff.added, []);
+  assert.deepStrictEqual(res.diff.lost, []);
+  assert.deepStrictEqual(res.diff.migrated, []);
+});
+
+check('diff: 同一条规则仅调整位置不算变化（按规则内容判定）', () => {
+  const res = analyze(
+    [
+      { method: 'GET', path: '/b' },
+      { method: 'GET', path: '/a' },
+    ],
+    {
+      baselineRules: [
+        { method: 'GET', path: '/a' },
+        { method: 'GET', path: '/b' },
+      ],
+    }
+  );
+  assert.strictEqual(res.diff.summary.total, 0);
+  assert.strictEqual(res.diff.identical, true);
+});
+
+check('diff: 新增覆盖 — 仅当前可命中的空间归入当前规则并给出最短见证', () => {
+  const res = analyze([{ method: 'GET', path: '/*' }], { baselineRules: [] });
+  assert.strictEqual(res.diff.summary.added, 1);
+  assert.strictEqual(res.diff.summary.total, 1);
+  assert.strictEqual(res.diff.added[0].current.index, 0);
+  // /* 可匹配根路径，最短见证为 GET /
+  assert.deepStrictEqual(res.diff.added[0].witness, { method: 'GET', path: '/' });
+});
+
+check('diff: 丢失覆盖 — 仅基线可命中的空间归入基线规则', () => {
+  const res = analyze([], { baselineRules: [{ method: 'POST', path: '/old/:id' }] });
+  assert.strictEqual(res.diff.summary.lost, 1);
+  assert.strictEqual(res.diff.summary.total, 1);
+  assert.strictEqual(res.diff.lost[0].baseline.index, 0);
+  assert.deepStrictEqual(res.diff.lost[0].witness, { method: 'POST', path: '/old/a' });
+});
+
+check('diff: 命中迁移 — 见证取段数最少、并列字典序最小的具体请求', () => {
+  const res = analyze([{ method: 'GET', path: '/:p/*' }], {
+    baselineRules: [{ method: 'GET', path: '/m/*' }],
+  });
+  // 迁移空间 = /m/*（两侧都命中，但命中规则内容不同）：最短为 /m
+  assert.strictEqual(res.diff.summary.migrated, 1);
+  assert.strictEqual(res.diff.migrated[0].baseline.path, '/m/*');
+  assert.strictEqual(res.diff.migrated[0].current.path, '/:p/*');
+  assert.deepStrictEqual(res.diff.migrated[0].witness, { method: 'GET', path: '/m' });
+  // 新增空间 = 一段以上且首段不为 m：最短且字典序最小为 /a
+  assert.strictEqual(res.diff.summary.added, 1);
+  assert.deepStrictEqual(res.diff.added[0].witness, { method: 'GET', path: '/a' });
+  // 丢失空间 = /m/* 中被 /:p/* 覆盖之外的部分：为空
+  assert.strictEqual(res.diff.summary.lost, 0);
+});
+
+check('diff: 重排只报真正改变命中内容的空间（首条命中语义）', () => {
+  const res = analyze(
+    [
+      { method: 'GET', path: '/a/b' },
+      { method: 'GET', path: '/a/*' },
+    ],
+    {
+      baselineRules: [
+        { method: 'GET', path: '/a/*' },
+        { method: 'GET', path: '/a/b' },
+      ],
+    }
+  );
+  // /a/b：基线首条命中 /a/*，当前首条命中 /a/b -> 迁移；
+  // 其余 /a/* 空间两侧都命中 /a/*（内容相同，位置不同）-> 不算变化
+  assert.strictEqual(res.diff.summary.total, 1);
+  assert.strictEqual(res.diff.summary.migrated, 1);
+  assert.deepStrictEqual(res.diff.migrated[0].witness, { method: 'GET', path: '/a/b' });
+});
+
+check('diff: 方法维度 — ALL 与具体方法的差异按方法分别定位见证', () => {
+  const res = analyze([{ method: 'GET', path: '/x' }], {
+    baselineRules: [{ method: 'ALL', path: '/x' }],
+  });
+  // GET /x：命中从 ALL /x 变为 GET /x（内容不同）-> 迁移
+  assert.strictEqual(res.diff.summary.migrated, 1);
+  assert.deepStrictEqual(res.diff.migrated[0].witness, { method: 'GET', path: '/x' });
+  // POST/PUT/...：基线可命中、当前无匹配 -> 丢失；方法取 METHODS 中最靠前的 POST
+  assert.strictEqual(res.diff.summary.lost, 1);
+  assert.deepStrictEqual(res.diff.lost[0].witness, { method: 'POST', path: '/x' });
+  assert.strictEqual(res.diff.summary.added, 0);
+});
+
+check('diff: 基线含无效规则时跳过并如实报告', () => {
+  const res = analyze([], {
+    baselineRules: [
+      { method: 'GET', path: 'bad-path' },
+      { method: 'GET', path: '/ok' },
+    ],
+  });
+  assert.strictEqual(res.diff.baselineRules.length, 2);
+  assert.strictEqual(res.diff.baselineRules[0].valid, false);
+  assert.strictEqual(res.diff.baselineRules[1].valid, true);
+  assert.strictEqual(res.diff.summary.lost, 1);
+  assert.strictEqual(res.diff.lost[0].baseline.index, 1);
+  assert.deepStrictEqual(res.diff.lost[0].witness, { method: 'GET', path: '/ok' });
+});
+
+check('diff: 空基线 + 空当前 -> 完全一致', () => {
+  const res = analyze([], { baselineRules: [] });
+  assert.strictEqual(res.diff.summary.total, 0);
+  assert.strictEqual(res.diff.identical, true);
+});
+
+check('diff: 确定性 — 相同输入多次计算结果完全一致', () => {
+  const rules = [
+    { method: 'GET', path: '/api/*' },
+    { method: 'GET', path: '/api/users/:id' },
+    { method: 'ALL', path: '/assets/*' },
+  ];
+  const baseline = [
+    { method: 'GET', path: '/api/users/*' },
+    { method: 'POST', path: '/api/users' },
+    { method: 'GET', path: '/old/*' },
+  ];
+  const d1 = analyze(rules, { baselineRules: baseline }).diff;
+  const d2 = analyze(rules, { baselineRules: baseline }).diff;
+  assert.deepStrictEqual(d1, d2);
+  // 丢失：POST /api/users 与 GET /old/*；迁移：/api/users/* 空间改由 /api/* 或 :id 命中
+  assert.strictEqual(d1.summary.lost, 2);
+  assert.ok(d1.summary.migrated >= 1);
+  assert.ok(d1.migrated.every((m) => m.witness && m.witness.method && m.witness.path));
+});
 
 console.log(`\n全部 ${passed} 个测试通过。`);
