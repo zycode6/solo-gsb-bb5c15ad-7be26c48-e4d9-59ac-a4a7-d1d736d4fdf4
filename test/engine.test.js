@@ -475,5 +475,207 @@ check('samples: 不传 samples 时响应不含相关字段（向后兼容）', (
   assert.strictEqual('sampleReplay' in res2.fixPlan, false);
 });
 
+// ---------- 版本差异审计（baselineRules / diff） ----------
+check('diff: 完全相同的两版规则行为一致', () => {
+  const rules = [
+    { method: 'GET', path: '/api/*' },
+    { method: 'GET', path: '/api/users/:id' },
+  ];
+  const res = analyze(rules, { baselineRules: rules.map((r) => ({ ...r })) });
+  assert.strictEqual(res.diff.identical, true);
+  assert.strictEqual(res.diff.truncated, false);
+  assert.strictEqual(res.diff.summary.total, 0);
+  assert.deepStrictEqual(res.diff.classes, []);
+  assert.strictEqual(res.diff.baseline.total, 2);
+  assert.strictEqual(res.diff.baseline.validCount, 2);
+});
+
+check('diff: 内容相同但顺序不同也视为一致（命中规则按方法+路径判定）', () => {
+  const res = analyze(
+    [
+      { method: 'GET', path: '/a' },
+      { method: 'GET', path: '/b' },
+    ],
+    {
+      baselineRules: [
+        { method: 'GET', path: '/b' },
+        { method: 'GET', path: '/a' },
+      ],
+    }
+  );
+  assert.strictEqual(res.diff.identical, true);
+});
+
+check('diff: 新增规则产生新增覆盖，见证为最短具体方法与路径', () => {
+  const res = analyze([{ method: 'GET', path: '/new/:id' }], { baselineRules: [] });
+  assert.strictEqual(res.diff.summary.added, 1);
+  assert.strictEqual(res.diff.summary.total, 1);
+  const c = res.diff.classes[0];
+  assert.strictEqual(c.kind, 'added');
+  assert.strictEqual(c.baseline, null);
+  assert.strictEqual(c.current.index, 0);
+  assert.strictEqual(c.witness.text, 'GET /new/a');
+});
+
+check('diff: 删除规则产生丢失覆盖，通配符零段匹配给出更短见证', () => {
+  const res = analyze([], { baselineRules: [{ method: 'GET', path: '/old/*' }] });
+  assert.strictEqual(res.diff.summary.lost, 1);
+  const c = res.diff.classes[0];
+  assert.strictEqual(c.kind, 'lost');
+  assert.strictEqual(c.current, null);
+  assert.strictEqual(c.baseline.index, 0);
+  assert.strictEqual(c.witness.text, 'GET /old'); // * 匹配零段，/old 即命中
+});
+
+check('diff: 命中迁移给出迁移双方与最短见证', () => {
+  const res = analyze(
+    [
+      { method: 'GET', path: '/api/users/:id' },
+      { method: 'GET', path: '/api/*' },
+    ],
+    { baselineRules: [{ method: 'GET', path: '/api/*' }] }
+  );
+  assert.strictEqual(res.diff.summary.migrated, 1);
+  assert.strictEqual(res.diff.summary.total, 1);
+  const c = res.diff.classes[0];
+  assert.strictEqual(c.kind, 'migrated');
+  assert.strictEqual(c.baseline.index, 0);
+  assert.strictEqual(c.baseline.path, '/api/*');
+  assert.strictEqual(c.current.index, 0);
+  assert.strictEqual(c.current.path, '/api/users/:id');
+  assert.strictEqual(c.witness.text, 'GET /api/users/a');
+});
+
+check('diff: 非字面量代表段——基线 /a、当前 /:x 时 /b 揭示新增覆盖', () => {
+  const res = analyze([{ method: 'GET', path: '/:x' }], {
+    baselineRules: [{ method: 'GET', path: '/a' }],
+  });
+  assert.strictEqual(res.diff.summary.added, 1);
+  assert.strictEqual(res.diff.summary.migrated, 1);
+  assert.strictEqual(res.diff.summary.total, 2);
+  const added = res.diff.classes.find((c) => c.kind === 'added');
+  const moved = res.diff.classes.find((c) => c.kind === 'migrated');
+  // "a" 本身是字面量，自由段代表值改取 b，否则会漏掉仅经非字面量段可达的差异类
+  assert.strictEqual(added.witness.text, 'GET /b');
+  assert.strictEqual(moved.witness.text, 'GET /a');
+  assert.strictEqual(moved.baseline.path, '/a');
+  assert.strictEqual(moved.current.path, '/:x');
+});
+
+check('diff: 方法维度——不同方法分别产生新增与丢失', () => {
+  const res = analyze([{ method: 'GET', path: '/x' }], {
+    baselineRules: [{ method: 'POST', path: '/x' }],
+  });
+  assert.strictEqual(res.diff.summary.added, 1);
+  assert.strictEqual(res.diff.summary.lost, 1);
+  const added = res.diff.classes.find((c) => c.kind === 'added');
+  const lost = res.diff.classes.find((c) => c.kind === 'lost');
+  assert.strictEqual(added.witness.text, 'GET /x');
+  assert.strictEqual(lost.witness.text, 'POST /x');
+});
+
+check('diff: ALL 规则只产生一个差异类，方法取 METHODS 顺序首个', () => {
+  const res = analyze([], { baselineRules: [{ method: 'ALL', path: '/h' }] });
+  assert.strictEqual(res.diff.summary.lost, 1);
+  assert.strictEqual(res.diff.summary.total, 1);
+  assert.strictEqual(res.diff.classes[0].witness.text, 'GET /h');
+});
+
+check('diff: 根路径可作为最短见证', () => {
+  const res = analyze([], { baselineRules: [{ method: 'GET', path: '/' }] });
+  assert.strictEqual(res.diff.classes[0].witness.text, 'GET /');
+});
+
+check('diff: 同一版本内首条命中拆分出的多个空间分别归类', () => {
+  const res = analyze(
+    [
+      { method: 'GET', path: '/:p/static' },
+      { method: 'GET', path: '/:p/:q' },
+    ],
+    { baselineRules: [] }
+  );
+  assert.strictEqual(res.diff.summary.added, 2);
+  const [c0, c1] = res.diff.classes;
+  assert.strictEqual(c0.current.path, '/:p/static');
+  assert.strictEqual(c0.witness.text, 'GET /a/static');
+  assert.strictEqual(c1.current.path, '/:p/:q');
+  assert.strictEqual(c1.witness.text, 'GET /a/a');
+});
+
+check('diff: 重复内容规则不产生伪差异', () => {
+  const res = analyze([{ method: 'GET', path: '/d' }], {
+    baselineRules: [
+      { method: 'GET', path: '/d' },
+      { method: 'GET', path: '/d' },
+    ],
+  });
+  assert.strictEqual(res.diff.identical, true);
+});
+
+check('diff: 基线含无效规则时忽略并如实报告', () => {
+  const res = analyze([], {
+    baselineRules: [
+      { method: 'GET', path: 'bad' },
+      { method: 'GET', path: '/ok' },
+    ],
+  });
+  assert.strictEqual(res.diff.baseline.total, 2);
+  assert.strictEqual(res.diff.baseline.validCount, 1);
+  assert.strictEqual(res.diff.baseline.invalid.length, 1);
+  assert.strictEqual(res.diff.baseline.invalid[0].index, 0);
+  assert.strictEqual(res.diff.summary.lost, 1);
+  assert.strictEqual(res.diff.classes[0].witness.text, 'GET /ok');
+});
+
+check('diff: 当前表的无效规则不参与命中', () => {
+  const res = analyze(
+    [
+      { method: 'GET', path: 'bad' },
+      { method: 'GET', path: '/ok' },
+    ],
+    { baselineRules: [] }
+  );
+  assert.strictEqual(res.diff.summary.added, 1);
+  assert.strictEqual(res.diff.classes[0].current.index, 1);
+});
+
+check('diff: 确定性——相同输入两次计算结果完全一致', () => {
+  const base = [
+    { method: 'GET', path: '/api/*' },
+    { method: 'ALL', path: '/assets/*' },
+    { method: 'POST', path: '/api/users' },
+  ];
+  const curr = [
+    { method: 'GET', path: '/api/users/:id' },
+    { method: 'GET', path: '/api/*' },
+    { method: 'GET', path: '/assets/css/*' },
+  ];
+  const d1 = analyze(curr, { baselineRules: base }).diff;
+  const d2 = analyze(curr, { baselineRules: base }).diff;
+  assert.deepStrictEqual(d1, d2);
+  // 迁移：/api/users/:id 提升、/assets/css/* 新增；丢失：POST /api/users、部分 /assets/*
+  assert.strictEqual(d1.summary.migrated, 2);
+  assert.strictEqual(d1.summary.lost, 2);
+  assert.strictEqual(d1.summary.added, 0);
+  assert.strictEqual(d1.summary.total, 4);
+});
+
+check('diff: 不传 baselineRules 时响应不含 diff（向后兼容）', () => {
+  const res = analyze([{ method: 'GET', path: '/a' }]);
+  assert.strictEqual('diff' in res, false);
+  const res2 = analyze([{ method: 'GET', path: '/a' }], { samples: ['GET /a'] });
+  assert.strictEqual('diff' in res2, false);
+});
+
+check('diff: 与 samples 可同时使用，互不影响', () => {
+  const res = analyze([{ method: 'GET', path: '/a' }], {
+    samples: ['GET /a'],
+    baselineRules: [],
+  });
+  assert.strictEqual(res.samples.results[0].hit.index, 0);
+  assert.strictEqual(res.diff.summary.added, 1);
+  assert.ok(res.fixPlan); // fixPlan 照常计算
+});
+
 
 console.log(`\n全部 ${passed} 个测试通过。`);

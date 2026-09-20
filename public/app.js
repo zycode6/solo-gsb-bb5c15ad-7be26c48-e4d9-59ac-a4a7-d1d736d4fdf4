@@ -6,6 +6,7 @@
 
 const STORAGE_KEY = 'route-conflict-lab.rules.v1';
 const SAMPLES_STORAGE_KEY = 'route-conflict-lab.samples.v1';
+const BASELINE_STORAGE_KEY = 'route-conflict-lab.baseline.v1';
 
 const DEFAULT_RULES = [
   { method: 'GET', path: '/api/*' },
@@ -37,8 +38,15 @@ const fixBtnEl = document.getElementById('btn-fix');
 const samplesInput = document.getElementById('samples-input');
 const samplesSummaryEl = document.getElementById('samples-summary');
 const samplesResultEl = document.getElementById('samples-result');
+const diffSummaryEl = document.getElementById('diff-summary');
+const diffStatusEl = document.getElementById('diff-status');
+const diffResultEl = document.getElementById('diff-result');
+const baselineViewEl = document.getElementById('baseline-view');
+const baselineListEl = document.getElementById('baseline-list');
+const baselineClearBtn = document.getElementById('btn-baseline-clear');
 
 let rules = loadRules();
+let baselineRules = loadBaseline();
 let dragIndex = null;
 let lastAnalysis = null;
 let debounceTimer = null;
@@ -65,6 +73,37 @@ function loadRules() {
 function saveRules() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(rules));
+  } catch (_e) {
+    /* 忽略隐私模式等写入失败 */
+  }
+}
+
+/* ---------------- 基线路由表（版本差异审计，仅保存在浏览器） ---------------- */
+
+function loadBaseline() {
+  try {
+    const raw = localStorage.getItem(BASELINE_STORAGE_KEY);
+    if (raw === null) return null; // 从未设置过基线
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed) && parsed.every((r) => r && typeof r.path === 'string')) {
+      return parsed.map((r) => ({
+        method: typeof r.method === 'string' ? r.method : 'GET',
+        path: r.path,
+      }));
+    }
+  } catch (_e) {
+    /* 存储损坏时视为未设置基线 */
+  }
+  return null;
+}
+
+function saveBaseline() {
+  try {
+    if (baselineRules === null) {
+      localStorage.removeItem(BASELINE_STORAGE_KEY);
+    } else {
+      localStorage.setItem(BASELINE_STORAGE_KEY, JSON.stringify(baselineRules));
+    }
   } catch (_e) {
     /* 忽略隐私模式等写入失败 */
   }
@@ -246,10 +285,12 @@ function scheduleAnalyze(immediate = false) {
 
 async function analyze() {
   try {
+    const payload = { rules, samples: currentSampleLines() };
+    if (baselineRules !== null) payload.baselineRules = baselineRules;
     const resp = await fetch('/api/analyze', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ rules, samples: currentSampleLines() }),
+      body: JSON.stringify(payload),
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     lastAnalysis = await resp.json();
@@ -261,6 +302,8 @@ async function analyze() {
       `<div class="empty-state">分析失败：${escapeHTML(err.message)}</div>`;
     samplesSummaryEl.innerHTML = '';
     samplesResultEl.innerHTML = '';
+    diffSummaryEl.innerHTML = '';
+    diffResultEl.innerHTML = '';
   }
 }
 
@@ -334,6 +377,9 @@ function paintAnalysis() {
 
   // 请求行为回归预演：按当前优先级逐条展示首条命中
   renderSamples(lastAnalysis.samples);
+
+  // 版本差异审计：基线 × 当前的全空间对比结果
+  renderDiff(lastAnalysis.diff);
 
   // 冲突卡片
   conflictsEl.innerHTML = '';
@@ -485,6 +531,243 @@ function locateRule(index) {
   }
   row.classList.add('row-locate');
   setTimeout(() => row.classList.remove('row-locate'), 1600);
+}
+
+/* ---------------- 版本差异审计（基线 × 当前，首条命中语义） ---------------- */
+
+function diffPill(cls, text, n) {
+  const el = document.createElement('span');
+  el.className = `pill ${cls}`;
+  const num = document.createElement('span');
+  num.className = 'n';
+  num.textContent = n;
+  el.append(num, ` ${text}`);
+  return el;
+}
+
+/** 规则引用芯片：baseline 侧只读展示，current 侧可点击定位到规则行 */
+function diffRuleChip(side, ref) {
+  const clickable = side === 'current';
+  const chip = document.createElement(clickable ? 'button' : 'span');
+  chip.className = `diff-rule-chip side-${side}`;
+  const tag = side === 'baseline' ? '基线' : '当前';
+  chip.textContent = `${tag} #${ref.index + 1} ${ref.method} ${ref.path}`;
+  if (clickable) {
+    chip.type = 'button';
+    chip.title = '点击定位到该规则';
+    chip.addEventListener('click', () => locateRule(ref.index));
+  }
+  return chip;
+}
+
+/** 最短见证请求芯片：点击回填到请求预演输入框 */
+function witnessChip(witness) {
+  const chip = document.createElement('button');
+  chip.type = 'button';
+  chip.className = 'witness-chip';
+  chip.textContent = witness.text;
+  chip.title = '最短见证请求（点击回填到请求预演）';
+  chip.addEventListener('click', () => backfillWitness(witness.text));
+  return chip;
+}
+
+/** 把见证请求追加到请求预演输入框（去重），并立即重算 */
+function backfillWitness(text) {
+  const lines = currentSampleLines();
+  if (lines.some((l) => l.trim() === text)) {
+    showToast(`预演中已存在：${text}`);
+  } else {
+    const trimmed = String(samplesInput.value || '').replace(/\s+$/, '');
+    samplesInput.value = trimmed ? `${trimmed}\n${text}` : text;
+    saveSamplesText();
+    showToast(`已回填请求预演：${text}`, 'ok');
+  }
+  scheduleAnalyze(true);
+  if (typeof samplesInput.scrollIntoView === 'function') {
+    samplesInput.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+}
+
+function renderDiff(diff) {
+  baselineClearBtn.hidden = baselineRules === null;
+  diffSummaryEl.innerHTML = '';
+  diffStatusEl.innerHTML = '';
+  diffResultEl.innerHTML = '';
+  baselineListEl.innerHTML = '';
+
+  if (baselineRules === null) {
+    baselineViewEl.hidden = true;
+    diffStatusEl.innerHTML =
+      '<div class="diff-empty">尚未设置基线路由表。点击「导入基线 JSON」或「快照当前为基线」后，' +
+      '系统会按<strong>首条命中语义</strong>在自动机上比较两个版本的全部请求空间，' +
+      '找出命中规则发生变化或仅一侧可命中的请求，并为每类变化给出确定性的最短见证请求。' +
+      '基线仅保存在浏览器本地。</div>';
+    return;
+  }
+
+  // 基线只读列表（语法错误的行标注，与 diff.baseline.invalid 对齐）
+  baselineViewEl.hidden = false;
+  const invalidMap = new Map();
+  if (diff && diff.baseline) {
+    for (const inv of diff.baseline.invalid) invalidMap.set(inv.index, inv.errors);
+  }
+  baselineRules.forEach((r, i) => {
+    const li = document.createElement('li');
+    li.className = 'baseline-row' + (invalidMap.has(i) ? ' baseline-invalid' : '');
+    const idx = document.createElement('span');
+    idx.className = 'idx';
+    idx.textContent = i + 1;
+    const m = document.createElement('span');
+    m.className = 'm';
+    m.textContent = (r.method || 'GET').toUpperCase();
+    const p = document.createElement('span');
+    p.className = 'p';
+    p.textContent = r.path;
+    li.append(idx, m, p);
+    if (invalidMap.has(i)) {
+      const err = document.createElement('span');
+      err.className = 'baseline-err';
+      err.textContent = invalidMap.get(i).join('；');
+      li.appendChild(err);
+    }
+    baselineListEl.appendChild(li);
+  });
+
+  if (!diff) return; // 分析结果尚未返回
+
+  const statusLine = document.createElement('div');
+  statusLine.className = 'diff-status-line';
+  statusLine.textContent =
+    `基线 ${diff.baseline.total} 条规则（${diff.baseline.validCount} 条有效）· ` +
+    `与当前 ${lastAnalysis.total} 条规则按首条命中语义对比全部请求空间`;
+  diffStatusEl.appendChild(statusLine);
+  if (diff.baseline.invalid.length > 0) {
+    const warn = document.createElement('div');
+    warn.className = 'diff-warn';
+    warn.textContent =
+      `⚠️ 基线中 ${diff.baseline.invalid.length} 条规则语法错误，已在对比中忽略（见上方基线列表）。`;
+    diffStatusEl.appendChild(warn);
+  }
+  if (diff.truncated) {
+    const warn = document.createElement('div');
+    warn.className = 'diff-warn';
+    warn.textContent = '⚠️ 请求空间状态数超过安全上限，结果已截断，可能未列出全部差异类。';
+    diffStatusEl.appendChild(warn);
+  }
+
+  diffSummaryEl.appendChild(diffPill('pill-added', '新增覆盖', diff.summary.added));
+  diffSummaryEl.appendChild(diffPill('pill-lost', '丢失覆盖', diff.summary.lost));
+  diffSummaryEl.appendChild(diffPill('pill-migrated', '命中迁移', diff.summary.migrated));
+  if (diff.summary.total === 0 && !diff.truncated) {
+    diffSummaryEl.appendChild(diffPill('pill-ok', '两版本行为一致', ''));
+  }
+
+  if (diff.summary.total === 0) {
+    diffResultEl.innerHTML = diff.identical
+      ? '<div class="empty-state"><span class="big">✅</span>两个版本的首条命中行为完全一致。<br/>' +
+        '任意方法与路径的请求，两版本命中的规则（按方法+路径判定）均相同。</div>'
+      : '<div class="empty-state"><span class="big">⚠️</span>已遍历的请求空间内未发现差异，' +
+        '但状态数超过安全上限被截断，无法保证两版本完全一致。</div>';
+    return;
+  }
+
+  diffResultEl.appendChild(
+    renderDiffKindSection(
+      'added',
+      '新增覆盖',
+      '当前版本可命中、基线无匹配的请求空间（按当前规则归组）',
+      diff.classes
+    )
+  );
+  diffResultEl.appendChild(
+    renderDiffKindSection(
+      'lost',
+      '丢失覆盖',
+      '基线可命中、当前版本无匹配的请求空间（按基线规则归组）',
+      diff.classes
+    )
+  );
+  diffResultEl.appendChild(
+    renderDiffKindSection(
+      'migrated',
+      '命中迁移',
+      '两侧均可命中、但命中规则不同的请求空间（按基线规则 → 当前规则归组）',
+      diff.classes
+    )
+  );
+}
+
+function renderDiffKindSection(kind, title, desc, classes) {
+  const list = classes.filter((c) => c.kind === kind);
+  const sec = document.createElement('section');
+  sec.className = `diff-kind dk-${kind}`;
+
+  const head = document.createElement('div');
+  head.className = 'diff-kind-head';
+  const t = document.createElement('span');
+  t.className = 'diff-kind-title';
+  t.textContent = `${title}（${list.length}）`;
+  const d = document.createElement('span');
+  d.className = 'diff-kind-desc';
+  d.textContent = desc;
+  head.append(t, d);
+  sec.appendChild(head);
+
+  if (list.length === 0) {
+    const none = document.createElement('div');
+    none.className = 'diff-none';
+    none.textContent = '无';
+    sec.appendChild(none);
+    return sec;
+  }
+
+  // 归组：新增覆盖按当前规则；丢失覆盖 / 命中迁移按基线规则
+  const groups = new Map();
+  for (const c of list) {
+    const anchor = kind === 'added' ? c.current : c.baseline;
+    if (!groups.has(anchor.index)) groups.set(anchor.index, { anchor, items: [] });
+    groups.get(anchor.index).items.push(c);
+  }
+  for (const g of groups.values()) {
+    sec.appendChild(renderDiffGroup(kind, g.anchor, g.items));
+  }
+  return sec;
+}
+
+function renderDiffGroup(kind, anchor, items) {
+  const card = document.createElement('div');
+  card.className = 'diff-group';
+
+  const head = document.createElement('div');
+  head.className = 'diff-group-head';
+  head.appendChild(diffRuleChip(kind === 'added' ? 'current' : 'baseline', anchor));
+  const note = document.createElement('span');
+  note.className = 'diff-group-note';
+  note.textContent =
+    kind === 'added'
+      ? '基线中无匹配'
+      : kind === 'lost'
+        ? '当前版本无匹配'
+        : '以下请求空间的命中迁移自该基线规则';
+  head.appendChild(note);
+  card.appendChild(head);
+
+  for (const c of items) {
+    const row = document.createElement('div');
+    row.className = 'diff-row';
+    if (kind === 'migrated') {
+      const arrow = document.createElement('span');
+      arrow.className = 'diff-arrow';
+      arrow.textContent = '→';
+      row.append(arrow, diffRuleChip('current', c.current));
+    }
+    const lab = document.createElement('span');
+    lab.className = 'witness-label';
+    lab.textContent = '最短见证';
+    row.append(lab, witnessChip(c.witness));
+    card.appendChild(row);
+  }
+  return card;
 }
 
 function escapeHTML(s) {
@@ -867,6 +1150,58 @@ document.getElementById('file-import').addEventListener('change', (e) => {
   reader.readAsText(file);
 });
 
+/* ---------------- 基线导入 / 快照 / 清除 ---------------- */
+
+document.getElementById('btn-baseline-import').addEventListener('click', () => {
+  document.getElementById('file-baseline').click();
+});
+
+document.getElementById('file-baseline').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const data = JSON.parse(String(reader.result));
+      // 与规则导入相同的格式：裸数组或 { rules: [...] }
+      const incoming = Array.isArray(data) ? data : data.rules;
+      if (!Array.isArray(incoming)) {
+        throw new Error('JSON 中未找到 rules 数组');
+      }
+      const cleaned = incoming
+        .filter((r) => r && typeof r === 'object')
+        .map((r) => ({
+          method: typeof r.method === 'string' ? r.method : 'GET',
+          path: String(r.path ?? ''),
+        }));
+      if (cleaned.length === 0) throw new Error('规则列表为空');
+      baselineRules = cleaned;
+      saveBaseline();
+      scheduleAnalyze(true);
+      showToast(`已导入基线：${cleaned.length} 条规则`, 'ok');
+    } catch (err) {
+      showToast(`基线导入失败：${err.message}`, 'error');
+    } finally {
+      e.target.value = '';
+    }
+  };
+  reader.readAsText(file);
+});
+
+document.getElementById('btn-baseline-snapshot').addEventListener('click', () => {
+  baselineRules = rules.map((r) => ({ method: r.method, path: r.path }));
+  saveBaseline();
+  scheduleAnalyze(true);
+  showToast(`已快照当前 ${rules.length} 条规则为基线`, 'ok');
+});
+
+baselineClearBtn.addEventListener('click', () => {
+  baselineRules = null;
+  saveBaseline();
+  scheduleAnalyze(true);
+  showToast('已清除基线', 'ok');
+});
+
 /* ---------------- 启动 ---------------- */
 samplesInput.value = loadSamplesText();
 samplesInput.addEventListener('input', () => {
@@ -874,4 +1209,5 @@ samplesInput.addEventListener('input', () => {
   scheduleAnalyze();
 });
 renderRules();
+renderDiff(null); // 首帧即展示基线状态（差异结果随首次分析返回后重绘）
 scheduleAnalyze(true);

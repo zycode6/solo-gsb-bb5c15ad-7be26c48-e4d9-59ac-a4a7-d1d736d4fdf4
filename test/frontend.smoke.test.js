@@ -56,7 +56,12 @@ function makeEl(tag) {
     },
     focus() {}, select() {}, click() { this.dispatch('click'); },
     get textContent() {
-      if (this.children.length) return this.children.map((c) => c.textContent).join('');
+      if (this.children.length) {
+        return this.children
+          .map((c) => (typeof c === 'string' ? c : c.textContent))
+          .join('');
+      }
+      if (this._html) return this._html.replace(/<[^>]*>/g, ''); // innerHTML 的文本部分
       return this._text;
     },
     set textContent(v) { this._text = String(v); this.children = []; },
@@ -70,6 +75,10 @@ const ids = [
   'rules-list', 'conflicts', 'summary', 'toast', 'fix-plan', 'btn-fix',
   'btn-add', 'btn-reset', 'btn-export', 'btn-import', 'file-import',
   'samples-input', 'samples-summary', 'samples-result',
+  'diff-summary', 'diff-status', 'diff-result',
+  'baseline-view', 'baseline-list',
+  'btn-baseline-import', 'btn-baseline-snapshot', 'btn-baseline-clear',
+  'file-baseline',
 ];
 const els = {};
 for (const id of ids) els[id] = makeEl('div');
@@ -86,6 +95,7 @@ const sandbox = {
   localStorage: {
     getItem: (k) => (k in storage ? storage[k] : null),
     setItem: (k, v) => { storage[k] = String(v); },
+    removeItem: (k) => { delete storage[k]; },
   },
   navigator: {},
   fetch: async (_url, opts) => {
@@ -93,7 +103,11 @@ const sandbox = {
     return {
       ok: true,
       status: 200,
-      json: async () => analyze(body.rules, { samples: body.samples }),
+      json: async () =>
+        analyze(body.rules, {
+          samples: body.samples,
+          baselineRules: body.baselineRules,
+        }),
     };
   },
   URL: { createObjectURL: () => 'blob:x', revokeObjectURL: () => {} },
@@ -231,6 +245,77 @@ vm.runInContext(code, sandbox);
   const saved2 = JSON.parse(storage['route-conflict-lab.rules.v1']);
   assert.strictEqual(saved2[3].path, '/*', '最宽泛的 /* 应移至末尾');
   assert.strictEqual(els['btn-fix'].hidden, false, '仍有 1 条不可避免遮蔽，按钮应保持可见');
+
+  // 5) 版本差异审计：未设基线时的空态 -> 快照当前为基线 -> 两版本行为一致
+  assert.ok(
+    els['diff-status'].textContent.includes('尚未设置基线'),
+    '未设基线时应展示引导提示'
+  );
+  assert.strictEqual(els['btn-baseline-clear'].hidden, true, '无基线时清除按钮应隐藏');
+  els['btn-baseline-snapshot'].dispatch('click');
+  await new Promise((r) => setTimeout(r, 30));
+  assert.ok(
+    els['diff-result'].textContent.includes('完全一致'),
+    '快照后两版本首条命中行为应完全一致'
+  );
+  assert.strictEqual(els['baseline-list'].children.length, 4, '基线只读列表应渲染 4 条规则');
+  assert.strictEqual(els['baseline-view'].hidden, false, '设置基线后应可展开查看基线表');
+  assert.strictEqual(els['btn-baseline-clear'].hidden, false, '设置基线后清除按钮应可见');
+  assert.ok(
+    storage['route-conflict-lab.baseline.v1'],
+    '基线应保存到 localStorage'
+  );
+
+  // 6) 编辑规则 -> 差异自动重算：/a 改为 /c 后，/c 的请求空间从基线 /* 迁移到当前 /c
+  const firstRow = els['rules-list'].children[0];
+  const pathInput = firstRow.querySelector('.path-input');
+  pathInput.value = '/c';
+  pathInput.dispatch('input');
+  await new Promise((r) => setTimeout(r, 250)); // 防抖 150ms
+  const diffText = els['diff-result'].textContent;
+  assert.ok(diffText.includes('命中迁移（1）'), '应归组展示 1 类命中迁移');
+  assert.ok(diffText.includes('新增覆盖（0）'), '不应出现新增覆盖');
+  assert.ok(diffText.includes('丢失覆盖（0）'), '不应出现丢失覆盖');
+  assert.ok(diffText.includes('基线 #4 GET /*'), '迁移应归组到基线 /* 规则');
+  assert.ok(diffText.includes('当前 #1 GET /c'), '迁移目标应为当前 /c 规则');
+  assert.ok(diffText.includes('GET /c'), '应给出最短见证 GET /c');
+  assert.ok(
+    els['diff-summary'].textContent.includes('命中迁移'),
+    '摘要应包含命中迁移计数'
+  );
+
+  // 7) 点击见证请求 -> 回填请求预演并自动重算
+  const chip = els['diff-result']
+    .querySelectorAll()
+    .find((c) => c.className === 'witness-chip' && c.textContent === 'GET /c');
+  assert.ok(chip, '应找到 GET /c 见证芯片');
+  chip.dispatch('click');
+  await new Promise((r) => setTimeout(r, 30));
+  assert.ok(
+    els['samples-input'].value.split('\n').includes('GET /c'),
+    '见证请求应回填到请求预演输入框'
+  );
+  assert.ok(
+    storage['route-conflict-lab.samples.v1'].split('\n').includes('GET /c'),
+    '回填后的样例文本应持久化'
+  );
+  assert.ok(
+    els['samples-result'].textContent.includes('#1 GET /c'),
+    '回填后预演应立即按当前规则重算命中'
+  );
+
+  // 8) 清除基线 -> 恢复空态，本地存储同步移除
+  els['btn-baseline-clear'].dispatch('click');
+  await new Promise((r) => setTimeout(r, 30));
+  assert.ok(
+    els['diff-status'].textContent.includes('尚未设置基线'),
+    '清除基线后应恢复引导提示'
+  );
+  assert.strictEqual(
+    'route-conflict-lab.baseline.v1' in storage,
+    false,
+    '清除基线后 localStorage 中不应保留基线'
+  );
 
   console.log('前端冒烟测试全部通过 ✓');
 })().catch((e) => {
